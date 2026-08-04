@@ -10133,32 +10133,36 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
         char hook_command[CLI_BUF_8K];
         char hook_command_windows[CLI_BUF_8K];
         cbm_agent_installed_binary_path(home, installed_binary, sizeof(installed_binary));
-        bool hook_ok =
+        bool hook_command_ok =
             cbm_build_augment_command(installed_binary, hook_command, sizeof(hook_command)) ==
                 CLI_OK &&
             cbm_build_augment_command_windows(installed_binary, hook_command_windows,
-                                              sizeof(hook_command_windows)) == CLI_OK &&
+                                              sizeof(hook_command_windows)) == CLI_OK;
+        bool hook_preflight_ok =
+            hook_command_ok &&
             cbm_check_codex_hooks_command(cp, hook_command, hook_command_windows) == CLI_OK;
-        if (!hook_ok) {
+        if (!hook_preflight_ok) {
             record_agent_config_error(true, "Codex CLI", "hook_preflight", cp);
         } else {
             uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Codex CLI", cp, ip}, dry_run,
                                       cbm_remove_codex_mcp_owned);
-            uninstall_agent_skill("Codex CLI", skills_dir, dry_run);
-            uninstall_tiered_agent_profiles(
-                (cbm_tiered_profile_set_t){
-                    .label = "Codex CLI",
-                    .verify_path = ap,
-                    .binary_path = installed_binary,
-                    .legacy_verify_content = legacy_codex_verify_agent_content,
-                    .dialect = CBM_GRAPH_DIALECT_CODEX,
-                },
-                dry_run);
             if (!dry_run && cbm_toml_reconcile_codex_hooks(cp, CODEX_HOOK_BEGIN, CODEX_HOOK_END,
                                                            hook_command, hook_command_windows,
                                                            CBM_TOML_CODEX_HOOK_REMOVE) != CLI_OK) {
                 record_agent_config_error(true, "Codex CLI", "hook_uninstall", cp);
             }
+        }
+        uninstall_agent_skill("Codex CLI", skills_dir, dry_run);
+        uninstall_tiered_agent_profiles(
+            (cbm_tiered_profile_set_t){
+                .label = "Codex CLI",
+                .verify_path = ap,
+                .binary_path = installed_binary,
+                .legacy_verify_content = legacy_codex_verify_agent_content,
+                .dialect = CBM_GRAPH_DIALECT_CODEX,
+            },
+            dry_run);
+        if (hook_command_ok) {
             char hooks_json[CLI_BUF_1K];
             snprintf(hooks_json, sizeof(hooks_json), "%s/hooks.json", config_dir);
             if (!dry_run && cbm_file_exists(hooks_json) &&

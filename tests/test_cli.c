@@ -8011,6 +8011,105 @@ TEST(cli_codex_hook_preflight_is_read_only) {
     PASS();
 }
 
+TEST(cli_codex_uninstall_preflight_cleans_owned_side_files) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-uninstall-preflight-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char codex_dir[512];
+    char config_path[640];
+    char hooks_path[640];
+    char skill_path[640];
+    char profile_paths[3][640];
+    char bin_dir[512];
+    char bin_path[640];
+    snprintf(codex_dir, sizeof(codex_dir), "%s/.codex", tmpdir);
+    snprintf(config_path, sizeof(config_path), "%s/config.toml", codex_dir);
+    snprintf(hooks_path, sizeof(hooks_path), "%s/hooks.json", codex_dir);
+    snprintf(skill_path, sizeof(skill_path), "%s/skills/codebase-memory/SKILL.md", codex_dir);
+    snprintf(profile_paths[0], sizeof(profile_paths[0]), "%s/agents/codebase-memory-scout.toml",
+             codex_dir);
+    snprintf(profile_paths[1], sizeof(profile_paths[1]), "%s/agents/codebase-memory.toml",
+             codex_dir);
+    snprintf(profile_paths[2], sizeof(profile_paths[2]), "%s/agents/codebase-memory-auditor.toml",
+             codex_dir);
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+#ifdef _WIN32
+    snprintf(bin_path, sizeof(bin_path), "%s/codebase-memory-mcp.exe", bin_dir);
+#else
+    snprintf(bin_path, sizeof(bin_path), "%s/codebase-memory-mcp", bin_dir);
+#endif
+    test_mkdirp(codex_dir);
+    test_mkdirp(bin_dir);
+    const char *foreign_hooks =
+        "{\n  \"hooks\": {\n    \"SessionStart\": [{ \"matcher\": \"foreign\", "
+        "\"hooks\": [{ \"type\": \"command\", \"command\": "
+        "\"/usr/bin/foreign-session\" }] }]\n  }\n}\n";
+    ASSERT_EQ(write_test_file(hooks_path, foreign_hooks), 0);
+    ASSERT_EQ(write_test_file(bin_path, "installed binary must remain live\n"), 0);
+
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_unsetenv("CODEX_HOME");
+
+    int install_rc = cbm_install_agent_configs(tmpdir, bin_path, false, false);
+    char *installed_hooks = read_test_file_alloc(hooks_path);
+    struct stat status;
+    bool side_files_installed = stat(skill_path, &status) == 0;
+    for (size_t i = 0U; i < sizeof(profile_paths) / sizeof(profile_paths[0]); ++i) {
+        side_files_installed = side_files_installed && stat(profile_paths[i], &status) == 0;
+    }
+    bool json_hooks_installed = installed_hooks && strstr(installed_hooks, "hook-augment") &&
+                                strstr(installed_hooks, "/usr/bin/foreign-session");
+    free(installed_hooks);
+
+    char ambiguous[8192];
+    snprintf(ambiguous, sizeof(ambiguous),
+             "[mcp_servers.codebase-memory-mcp]\ncommand = \"%s\"\n"
+             "[hooks]\nSessionStart = [{ matcher = \"startup|resume|clear|compact\", "
+             "matcher = \"startup|resume|clear|compact\", hooks = [] }]\n",
+             bin_path);
+    ASSERT_EQ(write_test_file(config_path, ambiguous), 0);
+
+    cli_activation_fake_t fake = {
+        .mutation_reserve_result = 1,
+    };
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    char *argv[] = {"--yes"};
+    int uninstall_rc = cli_test_cmd_uninstall(1, argv);
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+
+    char *after_toml = read_test_file_alloc(config_path);
+    char *after_hooks = read_test_file_alloc(hooks_path);
+    bool toml_preserved = after_toml && strcmp(after_toml, ambiguous) == 0;
+    bool json_cleaned = after_hooks && strstr(after_hooks, "/usr/bin/foreign-session") &&
+                        !strstr(after_hooks, "hook-augment");
+    bool owned_side_files_removed = stat(skill_path, &status) != 0;
+    for (size_t i = 0U; i < sizeof(profile_paths) / sizeof(profile_paths[0]); ++i) {
+        owned_side_files_removed = owned_side_files_removed && stat(profile_paths[i], &status) != 0;
+    }
+    bool binary_preserved = stat(bin_path, &status) == 0;
+    free(after_toml);
+    free(after_hooks);
+
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CODEX_HOME", saved_codex);
+    test_rmdir_r(tmpdir);
+    if (install_rc != 0 || uninstall_rc == 0 || !side_files_installed || !json_hooks_installed ||
+        !toml_preserved || !json_cleaned || !owned_side_files_removed || !binary_preserved ||
+        fake.mutation_reserve_count != 1 || fake.mutation_lease_release_count != 1)
+        FAIL("Codex uninstall preflight must preserve ambiguous TOML and the live binary while "
+             "cleaning independently owned side files");
+    PASS();
+}
+
 TEST(cli_codex_hook_cli_lifecycle) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-hook-lifecycle-XXXXXX");
@@ -12244,6 +12343,7 @@ SUITE(cli) {
     RUN_TEST(cli_codex_session_hook_issue330);
     RUN_TEST(cli_codex_inline_hook_issue1432);
     RUN_TEST(cli_codex_hook_preflight_is_read_only);
+    RUN_TEST(cli_codex_uninstall_preflight_cleans_owned_side_files);
     RUN_TEST(cli_codex_hook_cli_lifecycle);
     RUN_TEST(cli_gemini_session_hook_parity);
     RUN_TEST(cli_claude_subagent_hook);

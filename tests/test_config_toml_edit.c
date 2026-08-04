@@ -572,6 +572,10 @@ TEST(config_toml_codex_malformed_and_ambiguous_are_byte_identical) {
          "matcher = \"startup|resume|clear|compact\"\n"),
         ("[hooks]\nSessionStart = [{ matcher = \"startup|resume|clear|compact\", hooks = "
          "[{ type = \"command\", command = \"foreign\", timeout = 5??? }] }]\n"),
+        ("[hooks]\nSessionStart = [{ matcher = \"startup|resume|clear|compact\", hooks = "
+         "[{ type = \"command\", command = \"foreign\", attempts = -0x10 }] }]\n"),
+        ("[hooks]\nSessionStart = [{ matcher = \"startup|resume|clear|compact\", hooks = "
+         "[{ type = \"command\", command = \"foreign\", attempts = +0o77 }] }]\n"),
         ("[hooks]\nSessionStart = [{ matcher = \"startup|resume|clear|compact\", "
          "matcher = \"startup|resume|clear|compact\", hooks = [] }]\n"),
     };
