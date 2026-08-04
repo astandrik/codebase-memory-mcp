@@ -30,6 +30,19 @@ int cbm_toml_upsert_managed_block(const char *file_path, const char *begin_marke
 int cbm_toml_remove_managed_block(const char *file_path, const char *begin_marker,
                                   const char *end_marker);
 
+typedef enum {
+    CBM_TOML_CODEX_HOOK_CHECK = 0,
+    CBM_TOML_CODEX_HOOK_UPSERT = 1,
+    CBM_TOML_CODEX_HOOK_REMOVE = 2,
+} cbm_toml_codex_hook_mode_t;
+
+/* Reconcile installer-owned Codex SessionStart/SubagentStart hooks across the
+ * supported inline and array-of-tables representations. CHECK performs the
+ * same fail-closed preflight without writing the file. */
+int cbm_toml_reconcile_codex_hooks(const char *file_path, const char *begin_marker,
+                                   const char *end_marker, const char *command,
+                                   const char *command_windows, cbm_toml_codex_hook_mode_t mode);
+
 /* Remove one pre-marker codebase-memory-mcp table only when it has the known
  * historical schema: one owned command basename, optional empty args, and no
  * unknown assignments or descendant tables. Returns 1 for a syntactically

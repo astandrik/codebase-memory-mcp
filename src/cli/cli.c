@@ -3369,34 +3369,18 @@ static int cbm_upsert_codex_hooks_command(const char *config_path, const char *c
     if (!config_path || !command || !command_windows) {
         return CLI_ERR;
     }
-    char escaped[CLI_BUF_8K];
-    char escaped_windows[CLI_BUF_8K];
-    if (cbm_toml_escape_basic_string(command, escaped, sizeof(escaped)) != CLI_OK ||
-        cbm_toml_escape_basic_string(command_windows, escaped_windows, sizeof(escaped_windows)) !=
-            CLI_OK) {
-        return CLI_ERR;
-    }
-    char block[CLI_BUF_8K];
-    int written = snprintf(block, sizeof(block),
-                           "[[hooks.SessionStart]]\n"
-                           "matcher = \"startup|resume|clear|compact\"\n\n"
-                           "[[hooks.SessionStart.hooks]]\n"
-                           "type = \"command\"\n"
-                           "command = \"%s\"\n"
-                           "command_windows = \"%s\"\n"
-                           "timeout = 5\n\n"
-                           "[[hooks.SubagentStart]]\n"
-                           "matcher = \"*\"\n\n"
-                           "[[hooks.SubagentStart.hooks]]\n"
-                           "type = \"command\"\n"
-                           "command = \"%s\"\n"
-                           "command_windows = \"%s\"\n"
-                           "timeout = 5\n",
-                           escaped, escaped_windows, escaped, escaped_windows);
-    if (written < 0 || (size_t)written >= sizeof(block)) {
-        return CLI_ERR;
-    }
-    return cbm_toml_upsert_managed_block(config_path, CODEX_HOOK_BEGIN, CODEX_HOOK_END, block) == 0
+    return cbm_toml_reconcile_codex_hooks(config_path, CODEX_HOOK_BEGIN, CODEX_HOOK_END, command,
+                                          command_windows, CBM_TOML_CODEX_HOOK_UPSERT) == 0
+               ? CLI_OK
+               : CLI_ERR;
+}
+
+static int cbm_check_codex_hooks_command(const char *config_path, const char *command,
+                                         const char *command_windows) {
+    return config_path && command && command_windows &&
+                   cbm_toml_reconcile_codex_hooks(config_path, CODEX_HOOK_BEGIN, CODEX_HOOK_END,
+                                                  command, command_windows,
+                                                  CBM_TOML_CODEX_HOOK_CHECK) == 0
                ? CLI_OK
                : CLI_ERR;
 }
@@ -3408,8 +3392,10 @@ int cbm_upsert_codex_hooks(const char *config_path) {
 }
 
 int cbm_remove_codex_hooks(const char *config_path) {
-    return config_path &&
-                   cbm_toml_remove_managed_block(config_path, CODEX_HOOK_BEGIN, CODEX_HOOK_END) == 0
+    return config_path && cbm_toml_reconcile_codex_hooks(
+                              config_path, CODEX_HOOK_BEGIN, CODEX_HOOK_END,
+                              "codebase-memory-mcp hook-augment",
+                              "codebase-memory-mcp hook-augment", CBM_TOML_CODEX_HOOK_REMOVE) == 0
                ? CLI_OK
                : CLI_ERR;
 }
@@ -8148,18 +8134,6 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         snprintf(ip, sizeof(ip), "%s/AGENTS.md", config_dir);
         snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
         snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.toml", config_dir);
-        install_generic_agent_config("Codex CLI", binary_path, cp, ip, dry_run,
-                                     cbm_upsert_codex_mcp);
-        install_agent_skill("Codex CLI", skills_dir, force, dry_run);
-        install_tiered_agent_profiles(
-            (cbm_tiered_profile_set_t){
-                .label = "Codex CLI",
-                .verify_path = ap,
-                .binary_path = binary_path,
-                .legacy_verify_content = legacy_codex_verify_agent_content,
-                .dialect = CBM_GRAPH_DIALECT_CODEX,
-            },
-            dry_run);
         /* Choose the hook target: if ~/.codex/hooks.json already exists, the
          * user manages Codex hooks via the JSON representation — write the
          * SessionStart reminder there instead of config.toml. Writing both
@@ -8169,43 +8143,52 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         snprintf(hooks_json, sizeof(hooks_json), "%s/hooks.json", config_dir);
         bool use_hooks_json = cbm_file_exists(hooks_json);
         const char *hook_target = use_hooks_json ? hooks_json : cp;
-        if (g_install_plan) {
-            plan_record("Codex CLI", "hook", hook_target);
-        } else {
-            bool hook_ok = true;
-            if (!dry_run) {
-                char command[CLI_BUF_8K];
-                char command_windows[CLI_BUF_8K];
-                if (cbm_build_augment_command(binary_path, command, sizeof(command)) == CLI_OK &&
-                    cbm_build_augment_command_windows(binary_path, command_windows,
-                                                      sizeof(command_windows)) == CLI_OK) {
-                    if (use_hooks_json) {
-                        if (cbm_upsert_paired_lifecycle_hooks_json(
-                                hooks_json, command, command_windows, NULL, CMM_HOOK_TIMEOUT_SEC) ==
-                            CLI_OK) {
-                            if (cbm_remove_codex_hooks(cp) != CLI_OK) {
-                                hook_ok = false;
-                                record_agent_config_error(false, "Codex CLI", "legacy_hook_cleanup",
-                                                          cp);
-                            }
-                        } else {
-                            hook_ok = false;
-                            record_agent_config_error(false, "Codex CLI", "hook_install",
-                                                      hooks_json);
-                        }
-                    } else {
-                        if (cbm_upsert_codex_hooks_command(cp, command, command_windows) !=
-                            CLI_OK) {
-                            hook_ok = false;
-                            record_agent_config_error(false, "Codex CLI", "hook_install", cp);
-                        }
+        char command[CLI_BUF_8K];
+        char command_windows[CLI_BUF_8K];
+        bool hook_ok = cbm_build_augment_command(binary_path, command, sizeof(command)) == CLI_OK &&
+                       cbm_build_augment_command_windows(binary_path, command_windows,
+                                                         sizeof(command_windows)) == CLI_OK;
+        if (!hook_ok) {
+            record_agent_config_error(false, "Codex CLI", "hook_command_build", hook_target);
+        } else if (cbm_check_codex_hooks_command(cp, command, command_windows) != CLI_OK) {
+            hook_ok = false;
+            record_agent_config_error(false, "Codex CLI", "hook_preflight", cp);
+        }
+        if (hook_ok) {
+            install_generic_agent_config("Codex CLI", binary_path, cp, ip, dry_run,
+                                         cbm_upsert_codex_mcp);
+            install_agent_skill("Codex CLI", skills_dir, force, dry_run);
+            install_tiered_agent_profiles(
+                (cbm_tiered_profile_set_t){
+                    .label = "Codex CLI",
+                    .verify_path = ap,
+                    .binary_path = binary_path,
+                    .legacy_verify_content = legacy_codex_verify_agent_content,
+                    .dialect = CBM_GRAPH_DIALECT_CODEX,
+                },
+                dry_run);
+            if (g_install_plan) {
+                plan_record("Codex CLI", "hook", hook_target);
+            } else if (!dry_run) {
+                if (use_hooks_json) {
+                    if (cbm_upsert_paired_lifecycle_hooks_json(hooks_json, command, command_windows,
+                                                               NULL,
+                                                               CMM_HOOK_TIMEOUT_SEC) != CLI_OK) {
+                        hook_ok = false;
+                        record_agent_config_error(false, "Codex CLI", "hook_install", hooks_json);
+                    } else if (cbm_toml_reconcile_codex_hooks(
+                                   cp, CODEX_HOOK_BEGIN, CODEX_HOOK_END, command, command_windows,
+                                   CBM_TOML_CODEX_HOOK_REMOVE) != CLI_OK) {
+                        hook_ok = false;
+                        record_agent_config_error(false, "Codex CLI", "legacy_hook_cleanup", cp);
                     }
-                } else {
+                } else if (cbm_upsert_codex_hooks_command(cp, command, command_windows) != CLI_OK) {
                     hook_ok = false;
-                    record_agent_config_error(false, "Codex CLI", "hook_command_build",
-                                              hook_target);
+                    record_agent_config_error(false, "Codex CLI", "hook_install", cp);
                 }
             }
+        }
+        if (!g_install_plan) {
             if (hook_ok) {
                 printf("  hooks: SessionStart + SubagentStart (dynamic graph context)\n");
             }
@@ -10147,30 +10130,39 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
         snprintf(ip, sizeof(ip), "%s/AGENTS.md", config_dir);
         snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
         snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.toml", config_dir);
+        char hook_command[CLI_BUF_8K];
+        char hook_command_windows[CLI_BUF_8K];
         cbm_agent_installed_binary_path(home, installed_binary, sizeof(installed_binary));
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Codex CLI", cp, ip}, dry_run,
-                                  cbm_remove_codex_mcp_owned);
-        uninstall_agent_skill("Codex CLI", skills_dir, dry_run);
-        uninstall_tiered_agent_profiles(
-            (cbm_tiered_profile_set_t){
-                .label = "Codex CLI",
-                .verify_path = ap,
-                .binary_path = installed_binary,
-                .legacy_verify_content = legacy_codex_verify_agent_content,
-                .dialect = CBM_GRAPH_DIALECT_CODEX,
-            },
-            dry_run);
-        if (!dry_run) {
-            if (cbm_remove_codex_hooks(cp) != CLI_OK) {
+        bool hook_ok =
+            cbm_build_augment_command(installed_binary, hook_command, sizeof(hook_command)) ==
+                CLI_OK &&
+            cbm_build_augment_command_windows(installed_binary, hook_command_windows,
+                                              sizeof(hook_command_windows)) == CLI_OK &&
+            cbm_check_codex_hooks_command(cp, hook_command, hook_command_windows) == CLI_OK;
+        if (!hook_ok) {
+            record_agent_config_error(true, "Codex CLI", "hook_preflight", cp);
+        } else {
+            uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Codex CLI", cp, ip}, dry_run,
+                                      cbm_remove_codex_mcp_owned);
+            uninstall_agent_skill("Codex CLI", skills_dir, dry_run);
+            uninstall_tiered_agent_profiles(
+                (cbm_tiered_profile_set_t){
+                    .label = "Codex CLI",
+                    .verify_path = ap,
+                    .binary_path = installed_binary,
+                    .legacy_verify_content = legacy_codex_verify_agent_content,
+                    .dialect = CBM_GRAPH_DIALECT_CODEX,
+                },
+                dry_run);
+            if (!dry_run && cbm_toml_reconcile_codex_hooks(cp, CODEX_HOOK_BEGIN, CODEX_HOOK_END,
+                                                           hook_command, hook_command_windows,
+                                                           CBM_TOML_CODEX_HOOK_REMOVE) != CLI_OK) {
                 record_agent_config_error(true, "Codex CLI", "hook_uninstall", cp);
             }
             char hooks_json[CLI_BUF_1K];
-            char hook_command[CLI_BUF_8K];
             snprintf(hooks_json, sizeof(hooks_json), "%s/hooks.json", config_dir);
-            if (cbm_file_exists(hooks_json) &&
-                (cbm_build_augment_command(installed_binary, hook_command, sizeof(hook_command)) !=
-                     CLI_OK ||
-                 cbm_remove_paired_lifecycle_hooks_json(hooks_json, hook_command) != CLI_OK)) {
+            if (!dry_run && cbm_file_exists(hooks_json) &&
+                cbm_remove_paired_lifecycle_hooks_json(hooks_json, hook_command) != CLI_OK) {
                 record_agent_config_error(true, "Codex CLI", "json_hook_uninstall", hooks_json);
             }
         }

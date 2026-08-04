@@ -7938,6 +7938,141 @@ TEST(cli_codex_session_hook_issue330) {
     PASS();
 }
 
+/* issue #1432: an existing inline hook must be reconciled in place instead of
+ * appending an array-of-tables definition for the same key. */
+TEST(cli_codex_inline_hook_issue1432) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-inline-hook-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char cfg[512];
+    snprintf(cfg, sizeof(cfg), "%s/config.toml", tmpdir);
+    const char *fixture =
+        "[hooks]\n"
+        "SessionStart = [{ matcher = \"startup|resume|clear|compact\", hooks = [{ type = "
+        "\"command\", command = \"echo \\\"Code discovery: prefer codebase-memory-mcp\\\"\" }] "
+        "}]\n";
+    write_test_file(cfg, fixture);
+
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    const char *installed = read_test_file(cfg);
+    ASSERT_NOT_NULL(installed);
+    ASSERT_NULL(strstr(installed, "[[hooks.SessionStart]]"));
+    ASSERT_NOT_NULL(strstr(installed, "SessionStart = ["));
+    ASSERT_NOT_NULL(strstr(installed, "SubagentStart = ["));
+    ASSERT_NOT_NULL(strstr(installed, "hook-augment"));
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_codex_hook_preflight_is_read_only) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-hook-preflight-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char codex_dir[512];
+    char config_path[640];
+    char instructions_path[640];
+    char profile_path[640];
+    snprintf(codex_dir, sizeof(codex_dir), "%s/.codex", tmpdir);
+    snprintf(config_path, sizeof(config_path), "%s/config.toml", codex_dir);
+    snprintf(instructions_path, sizeof(instructions_path), "%s/AGENTS.md", codex_dir);
+    snprintf(profile_path, sizeof(profile_path), "%s/agents/codebase-memory.toml", codex_dir);
+    test_mkdirp(codex_dir);
+    const char *ambiguous =
+        "[hooks]\n"
+        "SessionStart = [{ matcher = \"startup|resume|clear|compact\", matcher = "
+        "\"startup|resume|clear|compact\", hooks = [] }]\n";
+    write_test_file(config_path, ambiguous);
+
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_unsetenv("CODEX_HOME");
+    int rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    char *after = read_test_file_alloc(config_path);
+    struct stat status;
+    bool preserved = after && strcmp(after, ambiguous) == 0;
+    bool no_codex_side_files =
+        stat(instructions_path, &status) != 0 && stat(profile_path, &status) != 0;
+    free(after);
+
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CODEX_HOME", saved_codex);
+    test_rmdir_r(tmpdir);
+    if (rc == 0 || !preserved || !no_codex_side_files)
+        FAIL("Codex hook preflight must fail before mutating any Codex config artifact");
+    PASS();
+}
+
+TEST(cli_codex_hook_cli_lifecycle) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-hook-lifecycle-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char codex_dir[512];
+    char config_path[640];
+    char binary_path[640];
+    snprintf(codex_dir, sizeof(codex_dir), "%s/.codex", tmpdir);
+    snprintf(config_path, sizeof(config_path), "%s/config.toml", codex_dir);
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+#else
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+#endif
+    test_mkdirp(codex_dir);
+    const char *personal = "model = \"user-selected-model\"\n";
+    write_test_file(config_path, personal);
+
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_unsetenv("CODEX_HOME");
+
+    int first_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    char *first = read_test_file_alloc(config_path);
+    int dry_run_rc = cbm_install_agent_configs(tmpdir, binary_path, false, true);
+    char *after_dry_run = read_test_file_alloc(config_path);
+    int second_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    char *second = read_test_file_alloc(config_path);
+    bool installed = first && strstr(first, personal) && strstr(first, "hook-augment") &&
+                     test_count_substring(first, "[[hooks.SessionStart]]") == 1U &&
+                     test_count_substring(first, "[[hooks.SubagentStart]]") == 1U;
+    bool dry_run_clean = first && after_dry_run && strcmp(first, after_dry_run) == 0;
+    bool idempotent = first && second && strcmp(first, second) == 0;
+    free(first);
+    free(after_dry_run);
+    free(second);
+
+    char *argv[] = {"uninstall", "--yes"};
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
+    cbm_set_auto_answer_for_test(0);
+    char *removed = read_test_file_alloc(config_path);
+    bool cleaned = removed && strstr(removed, personal) && !strstr(removed, "hook-augment") &&
+                   !strstr(removed, "hooks.SessionStart") &&
+                   !strstr(removed, "hooks.SubagentStart");
+    free(removed);
+
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CODEX_HOME", saved_codex);
+    test_rmdir_r(tmpdir);
+    if (first_rc != 0 || dry_run_rc != 0 || second_rc != 0 || uninstall_rc != 0 || !installed ||
+        !dry_run_clean || !idempotent || !cleaned)
+        FAIL("Codex CLI hooks must install idempotently, survive dry-run byte-identically, and "
+             "uninstall without removing user config");
+    PASS();
+}
+
 /* Gemini/Antigravity SessionStart reminder parity (settings.json JSON path). */
 TEST(cli_gemini_session_hook_parity) {
     char tmpdir[256];
@@ -8849,30 +8984,50 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
     snprintf(codex_dir, sizeof(codex_dir), "%s/.codex", tmpdir);
     test_mkdirp(codex_dir);
 
+    char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
     char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
     cbm_setenv("PATH", tmpdir, 1);
     cbm_unsetenv("CODEX_HOME");
-    cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
 
     char hooks_path[640];
     char config_path[640];
     snprintf(hooks_path, sizeof(hooks_path), "%s/hooks.json", codex_dir);
     snprintf(config_path, sizeof(config_path), "%s/config.toml", codex_dir);
+    const char *inline_owned =
+        "[hooks]\n"
+        "SessionStart = [{ matcher = \"startup|resume|clear|compact\", hooks = ["
+        "{ type = \"command\", command = \"codebase-memory-mcp hook-augment\", "
+        "command_windows = \"codebase-memory-mcp hook-augment\", timeout = 5 }, "
+        "{ type = \"command\", command = \"/usr/bin/user-session-hook\", timeout = 9 }] }]\n"
+        "SubagentStart = [{ matcher = \"*\", hooks = [{ type = \"command\", command = "
+        "\"codebase-memory-mcp hook-augment\", command_windows = "
+        "\"codebase-memory-mcp hook-augment\", timeout = 5 }] }]\n";
+    write_test_file(config_path, inline_owned);
     write_test_file(hooks_path, "{}\n");
-    cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    int first_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
 
-    char *toml = read_test_file_alloc(config_path);
-    char *hooks = read_test_file_alloc(hooks_path);
-    bool migrated = toml && !strstr(toml, "codebase-memory-mcp SessionStart") && hooks &&
-                    strstr(hooks, "SessionStart") && strstr(hooks, "SubagentStart");
-    free(toml);
-    free(hooks);
+    char *first_toml = read_test_file_alloc(config_path);
+    char *first_hooks = read_test_file_alloc(hooks_path);
+    int second_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    char *second_toml = read_test_file_alloc(config_path);
+    char *second_hooks = read_test_file_alloc(hooks_path);
+    bool migrated = first_toml && first_hooks && second_toml && second_hooks &&
+                    strstr(first_toml, "/usr/bin/user-session-hook") &&
+                    !strstr(first_toml, "hook-augment") && strstr(first_hooks, "SessionStart") &&
+                    strstr(first_hooks, "SubagentStart") && strstr(first_hooks, "hook-augment") &&
+                    strcmp(first_toml, second_toml) == 0 && strcmp(first_hooks, second_hooks) == 0;
+    free(first_toml);
+    free(first_hooks);
+    free(second_toml);
+    free(second_hooks);
+    restore_test_env("HOME", saved_home);
     restore_test_env("PATH", saved_path);
     restore_test_env("CODEX_HOME", saved_codex);
     test_rmdir_r(tmpdir);
-    if (!migrated)
-        FAIL("Codex install must leave exactly one lifecycle hook representation");
+    if (first_rc != 0 || second_rc != 0 || !migrated)
+        FAIL("Codex install must migrate owned inline TOML hooks to one JSON representation");
     PASS();
 }
 
@@ -12087,6 +12242,9 @@ SUITE(cli) {
     RUN_TEST(cli_hook_metadata_rejects_truncated_utf8_without_oob);
     RUN_TEST(cli_aider_config_loads_installed_conventions);
     RUN_TEST(cli_codex_session_hook_issue330);
+    RUN_TEST(cli_codex_inline_hook_issue1432);
+    RUN_TEST(cli_codex_hook_preflight_is_read_only);
+    RUN_TEST(cli_codex_hook_cli_lifecycle);
     RUN_TEST(cli_gemini_session_hook_parity);
     RUN_TEST(cli_claude_subagent_hook);
     RUN_TEST(cli_claude_hook_mutation_converges_mixed_owned_duplicates);
