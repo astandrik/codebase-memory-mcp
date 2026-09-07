@@ -1,0 +1,479 @@
+---
+name: Issue 2034 native Windows verification
+'on':
+  push:
+    branches:
+    - astandrik/verify-issue-2034-windows
+permissions:
+  contents: read
+concurrency:
+  group: issue2034-windows-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  SOURCE_HEAD: 8e29e1568f442ed9422e0fcd24d2594ae0ba7893
+  SOURCE_BASE: aa44c28ea5ea82a5f811f0bace4f7857a68cac80
+  PYTHONUTF8: '1'
+jobs:
+  arm64-full:
+    name: Native Windows ARM64 full tests
+    if: github.repository == 'astandrik/codebase-memory-mcp'
+    runs-on: windows-11-arm
+    timeout-minutes: 240
+    steps:
+    - name: Checkout pinned candidate
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: astandrik/codebase-memory-mcp
+        ref: 8e29e1568f442ed9422e0fcd24d2594ae0ba7893
+        path: candidate
+        persist-credentials: false
+    - name: Record immutable source and runner
+      shell: python
+      run: |
+        from pathlib import Path
+        import os, subprocess, json, hashlib, platform
+        workspace = Path(os.environ["GITHUB_WORKSPACE"])
+        evidence = Path(os.environ["RUNNER_TEMP"]) / "issue2034-evidence"
+        evidence.mkdir(exist_ok=True)
+        env = os.environ.copy()
+        for key in subprocess.check_output(
+                ["git", "rev-parse", "--local-env-vars"],
+                cwd=workspace / "candidate", text=True).splitlines():
+            env.pop(key, None)
+        roles = {"candidate": os.environ["SOURCE_HEAD"]}
+        if (workspace / "base").exists():
+            roles["base"] = os.environ["SOURCE_BASE"]
+        records = {}
+        trees = {}
+        for role, expected in roles.items():
+            source = workspace / role
+            def git(*args):
+                return subprocess.check_output(["git", *args], cwd=source, env=env, text=True).strip()
+            actual = git("rev-parse", "HEAD")
+            if actual != expected or git("status", "--porcelain=v1", "--untracked-files=no"):
+                raise RuntimeError("Source checkout mismatch: " + role)
+            pipeline = source / "tests/test_pipeline.c"
+            records[role] = {
+                "sha": actual, "tree": git("rev-parse", "HEAD^{tree}"),
+                "pipeline_blob": git("rev-parse", "HEAD:tests/test_pipeline.c"),
+                "pipeline_working_sha256": hashlib.sha256(pipeline.read_bytes()).hexdigest(),
+                "guard_sha256": hashlib.sha256(
+                    (source / "tests/windows/test_daemon_stability.py").read_bytes()).hexdigest(),
+            }
+            trees[role] = dict(line.split("\t", 1)[::-1]
+                               for line in git("ls-tree", "-r", "HEAD").splitlines())
+        if "base" in trees:
+            changed = sorted(path for path in trees["candidate"].keys() | trees["base"].keys()
+                             if trees["candidate"].get(path) != trees["base"].get(path))
+            if changed != ["tests/test_pipeline.c"]:
+                raise RuntimeError("Unexpected comparison scope: " + repr(changed))
+        if records["candidate"]["pipeline_blob"] != "cbb9d00cf53e7325f2731bc5e82c16d0ae090aa9":
+            raise RuntimeError("Unexpected candidate pipeline blob")
+        record = {
+            "workflow_sha": os.environ["GITHUB_SHA"],
+            "run_id": os.environ["GITHUB_RUN_ID"],
+            "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+            "runner_os": os.environ["RUNNER_OS"], "runner_arch": os.environ["RUNNER_ARCH"],
+            "python": platform.python_version(), "roles": records,
+        }
+        (evidence / "source-before.json").write_text(json.dumps(record, indent=2) + "\n")
+        print(json.dumps(record, indent=2), flush=True)
+    - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884
+      with:
+        msystem: CLANGARM64
+        path-type: inherit
+        install: mingw-w64-clang-aarch64-clang mingw-w64-clang-aarch64-compiler-rt
+          mingw-w64-clang-aarch64-zlib mingw-w64-clang-aarch64-python3 mingw-w64-clang-aarch64-ccache
+          make git zip
+    - name: Create protected test temp root
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $root = & candidate/scripts/ci/new-protected-temp-root.ps1 -Prefix 'cbm-2034-arm-' -ProtectDir (Join-Path $env:GITHUB_WORKSPACE 'candidate/build/c')
+        "CBM_CI_TEMP_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    - name: Run all registered suites with native trap UBSan
+      shell: msys2 {0}
+      run: |
+        set -uo pipefail
+        cd candidate
+        evidence="$(cygpath -u "$RUNNER_TEMP")/issue2034-evidence"
+        mkdir -p "$evidence"
+        while IFS= read -r key; do unset "$key"; done < <(git rev-parse --local-env-vars)
+        unset CBM_SKIP_PERF CBM_TEST_SHARD SANITIZE
+        export TEMP="$(cygpath -m "$CBM_CI_TEMP_ROOT")"
+        export TMP="$TEMP"
+        export TMPDIR="$(cygpath -u "$CBM_CI_TEMP_ROOT")"
+        export CCACHE_DIR="$(cygpath -u "$RUNNER_TEMP")/issue2034-ccache"
+        export CCACHE_MAXSIZE=1500M
+        {
+          uname -a
+          clang --version
+          clang -dumpmachine
+          python --version
+          git --version
+        } > "$evidence/toolchain.txt"
+        test "$MSYSTEM" = CLANGARM64 || exit 90
+        case "$(clang -dumpmachine)" in aarch64-*) ;; *) exit 91 ;; esac
+        set +e
+        scripts/test.sh CC=clang CXX=clang++ 2>&1 | tee "$evidence/full-arm64.log"
+        rc=$?
+        printf '%s\n' "$rc" > "$evidence/full-arm64.exit-code"
+        exit "$rc"
+    - name: Retain suite logs and verify native binary/source
+      shell: python
+      run: |
+        from pathlib import Path
+        import os, json, subprocess, hashlib, shutil, struct
+        workspace = Path(os.environ["GITHUB_WORKSPACE"])
+        evidence = Path(os.environ["RUNNER_TEMP"]) / "issue2034-evidence"
+        evidence.mkdir(exist_ok=True)
+        before_path = evidence / "source-before.json"
+        if not before_path.exists():
+            raise RuntimeError("Source preflight did not complete")
+        before = json.loads(before_path.read_text())
+        records = {}
+        errors = []
+        env = os.environ.copy()
+        for key in subprocess.check_output(
+                ["git", "rev-parse", "--local-env-vars"],
+                cwd=workspace / "candidate", text=True).splitlines():
+            env.pop(key, None)
+        for role, expected in before["roles"].items():
+            source = workspace / role
+            sha = subprocess.check_output(["git", "rev-parse", "HEAD"],
+                                          cwd=source, env=env, text=True).strip()
+            status = subprocess.check_output(
+                ["git", "status", "--porcelain=v1", "--untracked-files=no"],
+                cwd=source, env=env, text=True)
+            pipeline_sha = hashlib.sha256((source / "tests/test_pipeline.c").read_bytes()).hexdigest()
+            guard_sha = hashlib.sha256(
+                (source / "tests/windows/test_daemon_stability.py").read_bytes()).hexdigest()
+            records[role] = {"sha": sha, "tracked_status": status,
+                             "pipeline_working_sha256": pipeline_sha, "guard_sha256": guard_sha}
+            if (sha != expected["sha"] or status or
+                    pipeline_sha != expected["pipeline_working_sha256"] or
+                    guard_sha != expected["guard_sha256"]):
+                errors.append("Source changed: " + role)
+            logs = source / "build/c/test-logs"
+            if logs.exists():
+                shutil.copytree(logs, evidence / (role + "-suite-logs"), dirs_exist_ok=True)
+            if os.environ["RUNNER_ARCH"] == "ARM64":
+                binary = next((source / name for name in
+                               ["build/c/test-runner.exe", "build/c/test-runner"]
+                               if (source / name).is_file()), None)
+                if binary is None:
+                    errors.append("Native test binary missing")
+                else:
+                    with binary.open("rb") as handle:
+                        handle.seek(0x3c)
+                        pe = struct.unpack("<I", handle.read(4))[0]
+                        handle.seek(pe)
+                        signature, machine = struct.unpack("<4sH", handle.read(6))
+                    records[role]["test_binary_machine"] = hex(machine)
+                    if signature != b"PE\0\0" or machine != 0xaa64:
+                        errors.append("Test binary is not native ARM64")
+        (evidence / "source-after.json").write_text(
+            json.dumps({"roles": records, "errors": errors}, indent=2) + "\n")
+        print(json.dumps({"roles": records, "errors": errors}, indent=2), flush=True)
+        if errors:
+            raise SystemExit(1)
+      if: always()
+    - name: Upload complete ARM64 evidence
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: issue2034-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+        path: "${{ runner.temp }}/issue2034-evidence"
+        if-no-files-found: error
+        retention-days: 14
+    - name: Remove owned protected temp root
+      shell: pwsh
+      run: |
+        if ($env:CBM_CI_TEMP_ROOT -and (Test-Path -LiteralPath $env:CBM_CI_TEMP_ROOT)) {
+            Remove-Item -LiteralPath $env:CBM_CI_TEMP_ROOT -Recurse -Force
+        }
+      if: always()
+  guard-comparison:
+    name: Windows x64 baseline and candidate guards
+    if: github.repository == 'astandrik/codebase-memory-mcp'
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+    - name: Checkout pinned base
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: astandrik/codebase-memory-mcp
+        ref: aa44c28ea5ea82a5f811f0bace4f7857a68cac80
+        path: base
+        persist-credentials: false
+    - name: Checkout pinned candidate
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: astandrik/codebase-memory-mcp
+        ref: 8e29e1568f442ed9422e0fcd24d2594ae0ba7893
+        path: candidate
+        persist-credentials: false
+    - name: Record source and verify one-file comparison
+      shell: python
+      run: |
+        from pathlib import Path
+        import os, subprocess, json, hashlib, platform
+        workspace = Path(os.environ["GITHUB_WORKSPACE"])
+        evidence = Path(os.environ["RUNNER_TEMP"]) / "issue2034-evidence"
+        evidence.mkdir(exist_ok=True)
+        env = os.environ.copy()
+        for key in subprocess.check_output(
+                ["git", "rev-parse", "--local-env-vars"],
+                cwd=workspace / "candidate", text=True).splitlines():
+            env.pop(key, None)
+        roles = {"candidate": os.environ["SOURCE_HEAD"]}
+        if (workspace / "base").exists():
+            roles["base"] = os.environ["SOURCE_BASE"]
+        records = {}
+        trees = {}
+        for role, expected in roles.items():
+            source = workspace / role
+            def git(*args):
+                return subprocess.check_output(["git", *args], cwd=source, env=env, text=True).strip()
+            actual = git("rev-parse", "HEAD")
+            if actual != expected or git("status", "--porcelain=v1", "--untracked-files=no"):
+                raise RuntimeError("Source checkout mismatch: " + role)
+            pipeline = source / "tests/test_pipeline.c"
+            records[role] = {
+                "sha": actual, "tree": git("rev-parse", "HEAD^{tree}"),
+                "pipeline_blob": git("rev-parse", "HEAD:tests/test_pipeline.c"),
+                "pipeline_working_sha256": hashlib.sha256(pipeline.read_bytes()).hexdigest(),
+                "guard_sha256": hashlib.sha256(
+                    (source / "tests/windows/test_daemon_stability.py").read_bytes()).hexdigest(),
+            }
+            trees[role] = dict(line.split("\t", 1)[::-1]
+                               for line in git("ls-tree", "-r", "HEAD").splitlines())
+        if "base" in trees:
+            changed = sorted(path for path in trees["candidate"].keys() | trees["base"].keys()
+                             if trees["candidate"].get(path) != trees["base"].get(path))
+            if changed != ["tests/test_pipeline.c"]:
+                raise RuntimeError("Unexpected comparison scope: " + repr(changed))
+        if records["candidate"]["pipeline_blob"] != "cbb9d00cf53e7325f2731bc5e82c16d0ae090aa9":
+            raise RuntimeError("Unexpected candidate pipeline blob")
+        record = {
+            "workflow_sha": os.environ["GITHUB_SHA"],
+            "run_id": os.environ["GITHUB_RUN_ID"],
+            "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+            "runner_os": os.environ["RUNNER_OS"], "runner_arch": os.environ["RUNNER_ARCH"],
+            "python": platform.python_version(), "roles": records,
+        }
+        (evidence / "source-before.json").write_text(json.dumps(record, indent=2) + "\n")
+        print(json.dumps(record, indent=2), flush=True)
+    - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884
+      with:
+        msystem: CLANG64
+        path-type: inherit
+        install: mingw-w64-clang-x86_64-clang mingw-w64-clang-x86_64-zlib mingw-w64-clang-x86_64-ccache
+          make git
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      with:
+        node-version: '22'
+    - name: Build both pinned production binaries
+      shell: msys2 {0}
+      run: |
+        set -euo pipefail
+        evidence="$(cygpath -u "$RUNNER_TEMP")/issue2034-evidence"
+        mkdir -p "$evidence"
+        while IFS= read -r key; do unset "$key"; done < <(git -C candidate rev-parse --local-env-vars)
+        export CCACHE_DIR="$(cygpath -u "$RUNNER_TEMP")/issue2034-ccache"
+        export CCACHE_MAXSIZE=1500M
+        { clang --version; clang -dumpmachine; git --version; node --version; } > "$evidence/toolchain.txt"
+        for role in base candidate; do
+          (cd "$role" && scripts/build.sh --with-ui CC=clang CXX=clang++ TEST_SEAMS=1) 2>&1 | tee "$evidence/$role-build.log"
+        done
+    - name: Stage protected binaries and stress namespaces
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $root = & candidate/scripts/ci/new-protected-temp-root.ps1 -Prefix 'cbm-2034-compare-'
+        $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        foreach ($role in @('base', 'candidate')) {
+            $dir = Join-Path $root $role
+            New-Item -ItemType Directory -Path $dir | Out-Null
+            $source = Join-Path $env:GITHUB_WORKSPACE "$role/build/c/codebase-memory-mcp.exe"
+            $binary = Join-Path $dir 'codebase-memory-mcp.exe'
+            Copy-Item -LiteralPath $source -Destination $binary
+            foreach ($path in @($dir, $binary)) {
+                $acl = Get-Acl -LiteralPath $path
+                $acl.SetOwner($sid)
+                Set-Acl -LiteralPath $path -AclObject $acl
+            }
+            if ((Get-FileHash $source -Algorithm SHA256).Hash -ne (Get-FileHash $binary -Algorithm SHA256).Hash) {
+                throw "Staged binary changed: $role"
+            }
+        }
+        "CBM_COMPARE_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "TEMP=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "TMP=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "TMPDIR=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    - name: Run stock guards and fixed alternating stability series
+      shell: python
+      run: |
+        from pathlib import Path
+        import os, subprocess, time, json, sys, hashlib
+        workspace = Path(os.environ["GITHUB_WORKSPACE"])
+        evidence = Path(os.environ["RUNNER_TEMP"]) / "issue2034-evidence"
+        evidence.mkdir(exist_ok=True)
+        env = os.environ.copy()
+        for key in subprocess.check_output(
+                ["git", "rev-parse", "--local-env-vars"],
+                cwd=workspace / "candidate", text=True).splitlines():
+            env.pop(key, None)
+        for key in ["CBM_SKIP_PERF", "CBM_TEST_SHARD", "CBM_RUNTIME_DIR", "CBM_CACHE_DIR"]:
+            env.pop(key, None)
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONUTF8"] = "1"
+        records = []
+        def execute(role, label, args, timeout):
+            log = evidence / (role + "-" + label + ".log")
+            started = time.monotonic()
+            timed_out = False
+            with log.open("wb") as handle:
+                child = subprocess.Popen(args, cwd=workspace / role, env=env,
+                                         stdout=handle, stderr=subprocess.STDOUT)
+                try:
+                    code = child.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    subprocess.run(["taskkill", "/PID", str(child.pid), "/T", "/F"],
+                                   stdout=handle, stderr=subprocess.STDOUT, check=False)
+                    try:
+                        child.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        child.wait()
+                    code = 124
+            content = log.read_text(encoding="utf-8-sig", errors="replace")
+            cold_pass = "PASS: 6 racing cold clients all succeeded" in content
+            cold_fail = "RED: cold-storm client" in content or "ephemeral daemon shared by the cold storm never retired" in content
+            precondition_skip = "Guards skipped (precondition):" in content or "SETUP FAIL" in content
+            record = {
+                "role": role, "label": label, "command": args, "exit_code": code,
+                "timeout": timed_out, "duration_seconds": round(time.monotonic() - started, 2),
+                "cold_storm_pass": cold_pass, "cold_storm_fail": cold_fail,
+                "cold_storm_observed": cold_pass or cold_fail,
+                "precondition_skip": precondition_skip,
+                "log_sha256": hashlib.sha256(log.read_bytes()).hexdigest(),
+            }
+            records.append(record)
+            (evidence / "guard-results.json").write_text(json.dumps(records, indent=2) + "\n")
+            print(json.dumps(record), flush=True)
+            for line in content.splitlines():
+                if "RED:" in line or "REGRESSION:" in line or "SETUP FAIL" in line:
+                    print(line, flush=True)
+            if timed_out:
+                raise RuntimeError("Timed out; remaining repetitions are incomplete")
+
+        for role in ["base", "candidate"]:
+            binary = workspace / role / "build/c/codebase-memory-mcp.exe"
+            if not binary.is_file():
+                raise RuntimeError("Product binary missing: " + role)
+            execute(role, "full-guards",
+                    ["pwsh", "-NoLogo", "-NoProfile", "-File", "scripts/test-windows.ps1",
+                     "-GuardsOnly", "-Binary", str(binary)], 1200)
+
+        # Fixed alternating repetitions preserve failures instead of retrying until green.
+        for number in range(1, 11):
+            order = ["base", "candidate"] if number % 2 else ["candidate", "base"]
+            for role in order:
+                binary = Path(os.environ["CBM_COMPARE_ROOT"]) / role / "codebase-memory-mcp.exe"
+                execute(role, "stability-%02d" % number,
+                        [sys.executable, "-u", "tests/windows/test_daemon_stability.py", str(binary)],
+                        600)
+
+        complete = (len(records) == 22 and
+                    all(sum(r["role"] == role and r["label"].startswith("stability-")
+                            for r in records) == 10 for role in ["base", "candidate"]))
+        failed = [r for r in records if r["exit_code"] != 0 or r["precondition_skip"]
+                  or not r["cold_storm_observed"]]
+        summary = {"complete": complete, "attempts": len(records), "failed_attempts": len(failed),
+                   "by_role": {role: {
+                       "attempts": sum(r["role"] == role for r in records),
+                       "nonzero": sum(r["role"] == role and r["exit_code"] != 0 for r in records),
+                       "cold_pass": sum(r["role"] == role and r["cold_storm_pass"] for r in records),
+                       "cold_fail": sum(r["role"] == role and r["cold_storm_fail"] for r in records),
+                   } for role in ["base", "candidate"]}}
+        (evidence / "guard-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        print(json.dumps(summary, indent=2), flush=True)
+        if not complete or failed:
+            raise SystemExit(1)
+    - name: Verify unchanged source and retain logs
+      shell: python
+      run: |
+        from pathlib import Path
+        import os, json, subprocess, hashlib, shutil, struct
+        workspace = Path(os.environ["GITHUB_WORKSPACE"])
+        evidence = Path(os.environ["RUNNER_TEMP"]) / "issue2034-evidence"
+        evidence.mkdir(exist_ok=True)
+        before_path = evidence / "source-before.json"
+        if not before_path.exists():
+            raise RuntimeError("Source preflight did not complete")
+        before = json.loads(before_path.read_text())
+        records = {}
+        errors = []
+        env = os.environ.copy()
+        for key in subprocess.check_output(
+                ["git", "rev-parse", "--local-env-vars"],
+                cwd=workspace / "candidate", text=True).splitlines():
+            env.pop(key, None)
+        for role, expected in before["roles"].items():
+            source = workspace / role
+            sha = subprocess.check_output(["git", "rev-parse", "HEAD"],
+                                          cwd=source, env=env, text=True).strip()
+            status = subprocess.check_output(
+                ["git", "status", "--porcelain=v1", "--untracked-files=no"],
+                cwd=source, env=env, text=True)
+            pipeline_sha = hashlib.sha256((source / "tests/test_pipeline.c").read_bytes()).hexdigest()
+            guard_sha = hashlib.sha256(
+                (source / "tests/windows/test_daemon_stability.py").read_bytes()).hexdigest()
+            records[role] = {"sha": sha, "tracked_status": status,
+                             "pipeline_working_sha256": pipeline_sha, "guard_sha256": guard_sha}
+            if (sha != expected["sha"] or status or
+                    pipeline_sha != expected["pipeline_working_sha256"] or
+                    guard_sha != expected["guard_sha256"]):
+                errors.append("Source changed: " + role)
+            logs = source / "build/c/test-logs"
+            if logs.exists():
+                shutil.copytree(logs, evidence / (role + "-suite-logs"), dirs_exist_ok=True)
+            if os.environ["RUNNER_ARCH"] == "ARM64":
+                binary = next((source / name for name in
+                               ["build/c/test-runner.exe", "build/c/test-runner"]
+                               if (source / name).is_file()), None)
+                if binary is None:
+                    errors.append("Native test binary missing")
+                else:
+                    with binary.open("rb") as handle:
+                        handle.seek(0x3c)
+                        pe = struct.unpack("<I", handle.read(4))[0]
+                        handle.seek(pe)
+                        signature, machine = struct.unpack("<4sH", handle.read(6))
+                    records[role]["test_binary_machine"] = hex(machine)
+                    if signature != b"PE\0\0" or machine != 0xaa64:
+                        errors.append("Test binary is not native ARM64")
+        (evidence / "source-after.json").write_text(
+            json.dumps({"roles": records, "errors": errors}, indent=2) + "\n")
+        print(json.dumps({"roles": records, "errors": errors}, indent=2), flush=True)
+        if errors:
+            raise SystemExit(1)
+      if: always()
+    - name: Upload every guard result
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: issue2034-guard-comparison-${{ github.run_id }}-${{ github.run_attempt
+          }}
+        path: "${{ runner.temp }}/issue2034-evidence"
+        if-no-files-found: error
+        retention-days: 14
+    - name: Remove owned comparison root
+      shell: pwsh
+      run: |
+        if ($env:CBM_COMPARE_ROOT -and (Test-Path -LiteralPath $env:CBM_COMPARE_ROOT)) {
+            Remove-Item -LiteralPath $env:CBM_COMPARE_ROOT -Recurse -Force
+        }
+      if: always()
